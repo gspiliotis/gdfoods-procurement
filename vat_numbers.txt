@@ -1,0 +1,8 @@
+# Supplier VAT numbers
+# Lines starting with # are comments
+# Anything after # on a line is also ignored
+
+094254743  # ZACO
+998117733  # bellemeat
+998603201  # Daily Taste
+095283785  # Lydia's
