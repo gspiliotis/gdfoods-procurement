@@ -1,8 +1,10 @@
-# Supplier VAT numbers
+# Supplier VAT numbers with date adjustment
+# Format: VAT_NUMBER DATE_ADJUSTMENT  # Comment
+# DATE_ADJUSTMENT: positive or negative integer to adjust invoice date
+# Example: -1 means subtract 1 day from invoice date, +1 means add 1 day
 # Lines starting with # are comments
-# Anything after # on a line is also ignored
 
-094254743  # ZACO
-998117733  # bellemeat
-998603201  # Daily Taste
-095283785  # Lydia's
+094254743  0   # ZACO - no adjustment
+998117733  -1  # bellemeat - subtract 1 day
+998603201  0   # Daily Taste - no adjustment
+095283785  0   # Lydia's - no adjustment

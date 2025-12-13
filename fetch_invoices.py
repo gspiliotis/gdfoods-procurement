@@ -3,19 +3,29 @@
 Fetch invoice data from myDATA API and generate Excel spreadsheet with aggregated quantities.
 """
 import argparse
+import os
 import sys
 import xml.etree.ElementTree as ET
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 import requests
 from openpyxl import Workbook
 from openpyxl.styles import Font
+from dotenv import load_dotenv
 
-# API Constants
-USER_ID = "gdfoods"
-API_KEY = "988ed25ba9de0d51813d0084498edb21"
+# Load environment variables from .env file
+load_dotenv()
+
+# API Constants - load from environment variables
+USER_ID = os.getenv("MYDATA_USER_ID")
+API_KEY = os.getenv("MYDATA_API_KEY")
 API_BASE_URL = "https://mydatapi.aade.gr/myDATA/RequestDocs"
+
+if not USER_ID or not API_KEY:
+    print("Error: MYDATA_USER_ID and MYDATA_API_KEY environment variables must be set", file=sys.stderr)
+    print("Please create a .env file with your credentials (see .env.example)", file=sys.stderr)
+    sys.exit(1)
 
 
 def convert_date_to_api_format(date_str: str) -> str:
@@ -176,26 +186,26 @@ def parse_invoices(xml_content: str) -> Tuple[List[Dict], Optional[str], Optiona
     return records, next_partition_key, next_row_key
 
 
-def fetch_all_invoices(date_from: str, date_to: str, vat_numbers: List[str]) -> List[Dict]:
+def fetch_all_invoices(date_from: str, date_to: str, vat_data: List[Tuple[str, int]]) -> List[Dict]:
     """
     Fetch all invoices for multiple VAT numbers with pagination.
 
     Args:
         date_from: Start date in YYYY-MM-DD format
         date_to: End date in YYYY-MM-DD format
-        vat_numbers: List of receiver VAT numbers
+        vat_data: List of tuples (vat_number, date_adjustment)
 
     Returns:
-        List of all invoice records
+        List of all invoice records with date_adjustment included
     """
     all_records = []
 
-    for vat_number in vat_numbers:
+    for vat_number, date_adjustment in vat_data:
         vat_number = vat_number.strip()
         if not vat_number:
             continue
 
-        print(f"Fetching invoices for VAT: {vat_number}")
+        print(f"Fetching invoices for VAT: {vat_number} (date adjustment: {date_adjustment:+d} days)")
 
         next_partition_key = None
         next_row_key = None
@@ -211,6 +221,11 @@ def fetch_all_invoices(date_from: str, date_to: str, vat_numbers: List[str]) -> 
                 break
 
             records, next_partition_key, next_row_key = parse_invoices(xml_content)
+
+            # Add date_adjustment to each record
+            for record in records:
+                record["date_adjustment"] = date_adjustment
+
             all_records.extend(records)
 
             print(f"  Page {page}: Found {len(records)} invoice items")
@@ -250,10 +265,10 @@ def get_greek_day_name(date_str: str) -> str:
 
 def aggregate_data(records: List[Dict]) -> Tuple[Dict[Tuple[str, str], Dict[str, float]], List[str]]:
     """
-    Aggregate quantities by (issuer, item, date).
+    Aggregate quantities by (issuer, item, date) with date adjustment applied.
 
     Args:
-        records: List of invoice records
+        records: List of invoice records with date_adjustment field
 
     Returns:
         Tuple of (aggregated data dict, sorted list of dates)
@@ -264,11 +279,20 @@ def aggregate_data(records: List[Dict]) -> Tuple[Dict[Tuple[str, str], Dict[str,
 
     for record in records:
         key = (record["issuer_name"], record["item_descr"])
-        date = record["issue_date"]
+        original_date = record["issue_date"]
         quantity = record["quantity"]
+        date_adjustment = record.get("date_adjustment", 0)
 
-        aggregated[key][date] += quantity
-        dates_set.add(date)
+        # Apply date adjustment
+        if date_adjustment != 0:
+            date_obj = datetime.strptime(original_date, "%Y-%m-%d")
+            adjusted_date_obj = date_obj + timedelta(days=date_adjustment)
+            adjusted_date = adjusted_date_obj.strftime("%Y-%m-%d")
+        else:
+            adjusted_date = original_date
+
+        aggregated[key][adjusted_date] += quantity
+        dates_set.add(adjusted_date)
 
     # Sort dates
     sorted_dates = sorted(list(dates_set))
@@ -360,28 +384,49 @@ def generate_csv(aggregated_data: Dict, dates: List[str], output_file: str):
     print(f"\nCSV file generated: {output_file}")
 
 
-def read_vat_numbers(filename: str) -> List[str]:
+def read_vat_numbers(filename: str) -> List[Tuple[str, int]]:
     """
-    Read VAT numbers from file (one per line).
+    Read VAT numbers and date adjustments from file.
     Lines starting with # are treated as comments and ignored.
     Anything after a # character on a line is also ignored.
 
+    Format: VAT_NUMBER DATE_ADJUSTMENT
+    Example: 094254743  -1
+
     Args:
-        filename: Path to file containing VAT numbers
+        filename: Path to file containing VAT numbers and date adjustments
 
     Returns:
-        List of VAT numbers
+        List of tuples (vat_number, date_adjustment)
     """
     try:
         with open(filename, 'r', encoding='utf-8') as f:
-            vat_numbers = []
+            vat_data = []
+            line_num = 0
             for line in f:
+                line_num += 1
                 # Remove comments (anything after #)
                 line = line.split('#')[0].strip()
-                # Add non-empty lines
-                if line:
-                    vat_numbers.append(line)
-            return vat_numbers
+                # Skip empty lines
+                if not line:
+                    continue
+
+                # Parse VAT number and date adjustment
+                parts = line.split()
+                if len(parts) < 2:
+                    print(f"Warning: Line {line_num} missing date adjustment, using 0: {line}", file=sys.stderr)
+                    vat_number = parts[0]
+                    date_adjustment = 0
+                else:
+                    vat_number = parts[0]
+                    try:
+                        date_adjustment = int(parts[1])
+                    except ValueError:
+                        print(f"Warning: Line {line_num} has invalid date adjustment, using 0: {line}", file=sys.stderr)
+                        date_adjustment = 0
+
+                vat_data.append((vat_number, date_adjustment))
+            return vat_data
     except FileNotFoundError:
         print(f"Error: File '{filename}' not found", file=sys.stderr)
         sys.exit(1)
