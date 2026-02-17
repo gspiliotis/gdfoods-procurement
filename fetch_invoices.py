@@ -12,6 +12,7 @@ from typing import Dict, List, Tuple, Optional
 import requests
 from openpyxl import Workbook
 from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -45,7 +46,7 @@ def convert_date_to_api_format(date_str: str) -> str:
 def fetch_invoices(
     date_from: str,
     date_to: str,
-    receiver_vat_number: str,
+    receiver_vat_number: Optional[str] = None,
     next_partition_key: Optional[str] = None,
     next_row_key: Optional[str] = None
 ) -> str:
@@ -55,7 +56,7 @@ def fetch_invoices(
     Args:
         date_from: Start date in YYYY-MM-DD format
         date_to: End date in YYYY-MM-DD format
-        receiver_vat_number: VAT number of the receiver
+        receiver_vat_number: VAT number of the receiver (optional, fetches all if None)
         next_partition_key: Pagination key for next partition
         next_row_key: Pagination key for next row
 
@@ -70,8 +71,10 @@ def fetch_invoices(
         "mark": "1",
         "dateFrom": api_date_from,
         "dateTo": api_date_to,
-        "receiverVatNumber": receiver_vat_number
     }
+
+    if receiver_vat_number:
+        params["receiverVatNumber"] = receiver_vat_number
 
     if next_partition_key:
         params["nextPartitionKey"] = next_partition_key
@@ -144,6 +147,9 @@ def parse_invoices(xml_content: str) -> Tuple[List[Dict], Optional[str], Optiona
         if issuer is None:
             continue
 
+        issuer_vat_elem = issuer.find("ns:vatNumber", ns)
+        issuer_vat = issuer_vat_elem.text.strip() if issuer_vat_elem is not None and issuer_vat_elem.text else ""
+
         issuer_name_elem = issuer.find("ns:name", ns)
         if issuer_name_elem is None or not issuer_name_elem.text:
             continue
@@ -178,6 +184,7 @@ def parse_invoices(xml_content: str) -> Tuple[List[Dict], Optional[str], Optiona
 
             records.append({
                 "issuer_name": issuer_name,
+                "issuer_vat": issuer_vat,
                 "item_descr": item_descr,
                 "issue_date": issue_date,
                 "quantity": quantity
@@ -186,58 +193,66 @@ def parse_invoices(xml_content: str) -> Tuple[List[Dict], Optional[str], Optiona
     return records, next_partition_key, next_row_key
 
 
-def fetch_all_invoices(date_from: str, date_to: str, vat_data: List[Tuple[str, int]]) -> List[Dict]:
+def fetch_all_invoices_for_period(date_from: str, date_to: str) -> List[Dict]:
     """
-    Fetch all invoices for multiple VAT numbers with pagination.
+    Fetch all invoices for the given date range (no VAT filtering).
 
     Args:
         date_from: Start date in YYYY-MM-DD format
         date_to: End date in YYYY-MM-DD format
+
+    Returns:
+        List of all invoice records
+    """
+    all_records = []
+    next_partition_key = None
+    next_row_key = None
+    page = 1
+
+    print(f"Fetching all invoices for period {date_from} to {date_to}...")
+
+    while True:
+        xml_content = fetch_invoices(
+            date_from, date_to,
+            next_partition_key=next_partition_key,
+            next_row_key=next_row_key
+        )
+
+        if not xml_content:
+            break
+
+        records, next_partition_key, next_row_key = parse_invoices(xml_content)
+        all_records.extend(records)
+
+        print(f"  Page {page}: Found {len(records)} invoice items")
+        page += 1
+
+        if not next_partition_key or not next_row_key:
+            break
+
+    print(f"Total invoice items fetched: {len(all_records)}")
+    return all_records
+
+
+def filter_by_vat_numbers(records: List[Dict], vat_data: List[Tuple[str, int]]) -> List[Dict]:
+    """
+    Filter records by issuer VAT numbers and apply date adjustments.
+
+    Args:
+        records: List of invoice records (must contain 'issuer_vat' field)
         vat_data: List of tuples (vat_number, date_adjustment)
 
     Returns:
-        List of all invoice records with date_adjustment included
+        Filtered list of records with date_adjustment set
     """
-    all_records = []
-
-    for vat_number, date_adjustment in vat_data:
-        vat_number = vat_number.strip()
-        if not vat_number:
-            continue
-
-        print(f"Fetching invoices for VAT: {vat_number} (date adjustment: {date_adjustment:+d} days)")
-
-        next_partition_key = None
-        next_row_key = None
-        page = 1
-
-        while True:
-            xml_content = fetch_invoices(
-                date_from, date_to, vat_number,
-                next_partition_key, next_row_key
-            )
-
-            if not xml_content:
-                break
-
-            records, next_partition_key, next_row_key = parse_invoices(xml_content)
-
-            # Add date_adjustment to each record
-            for record in records:
-                record["date_adjustment"] = date_adjustment
-
-            all_records.extend(records)
-
-            print(f"  Page {page}: Found {len(records)} invoice items")
-            page += 1
-
-            # If no pagination tokens, we're done with this VAT number
-            if not next_partition_key or not next_row_key:
-                break
-
-        print(f"  Total items for {vat_number}: {len([r for r in all_records if vat_number in str(r)])}")
-
-    return all_records
+    vat_map = {vat.strip(): adj for vat, adj in vat_data}
+    filtered = []
+    for record in records:
+        issuer_vat = record.get("issuer_vat", "")
+        if issuer_vat in vat_map:
+            record["date_adjustment"] = vat_map[issuer_vat]
+            filtered.append(record)
+    return filtered
 
 
 def get_greek_day_name(date_str: str) -> str:
@@ -345,7 +360,7 @@ def generate_excel(aggregated_data: Dict, dates: List[str], output_file: str):
     ws.column_dimensions['A'].width = 50
     ws.column_dimensions['B'].width = 60
     for col_idx in range(3, len(dates) + 3):
-        ws.column_dimensions[chr(64 + col_idx)].width = 12
+        ws.column_dimensions[get_column_letter(col_idx)].width = 12
 
     wb.save(output_file)
     print(f"\nExcel file generated: {output_file}")
@@ -444,6 +459,29 @@ def validate_date(date_str: str) -> bool:
         return False
 
 
+def write_vat_output(records: List[Dict], output_file: str):
+    """
+    Write unique issuer VAT numbers from records to a file.
+
+    Args:
+        records: List of invoice records
+        output_file: Path to the output file
+    """
+    # Collect unique VATs with their issuer names
+    vat_info = {}
+    for record in records:
+        vat = record.get("issuer_vat", "")
+        if vat and vat not in vat_info:
+            vat_info[vat] = record.get("issuer_name", "")
+
+    with open(output_file, 'w', encoding='utf-8') as f:
+        for vat in sorted(vat_info.keys()):
+            name = vat_info[vat]
+            f.write(f"{vat}  0   # {name}\n")
+
+    print(f"\nVAT numbers file generated: {output_file} ({len(vat_info)} unique VAT numbers)")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Fetch invoice data from myDATA API and generate Excel/CSV report"
@@ -458,7 +496,9 @@ def main():
     )
     parser.add_argument(
         "vat_file",
-        help="File containing receiver VAT numbers (one per line)"
+        nargs="?",
+        default=None,
+        help="File containing VAT numbers to filter by (optional; if omitted, all invoices are fetched)"
     )
     parser.add_argument(
         "-o", "--output",
@@ -470,6 +510,11 @@ def main():
         choices=["xlsx", "csv", "both"],
         default="xlsx",
         help="Output format (default: xlsx)"
+    )
+    parser.add_argument(
+        "--vat-out",
+        default=None,
+        help="Output file to write unique VAT numbers found in fetched invoices (optional)"
     )
 
     args = parser.parse_args()
@@ -483,27 +528,41 @@ def main():
         print(f"Error: Invalid end date '{args.end_date}'. Use YYYY-MM-DD format.", file=sys.stderr)
         sys.exit(1)
 
-    # Read VAT numbers
-    vat_numbers = read_vat_numbers(args.vat_file)
-    if not vat_numbers:
-        print("Error: No VAT numbers found in file", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Found {len(vat_numbers)} VAT number(s) to process")
     print(f"Date range: {args.start_date} to {args.end_date}\n")
 
-    # Fetch all invoices
-    records = fetch_all_invoices(args.start_date, args.end_date, vat_numbers)
+    # Fetch all invoices for the period
+    all_records = fetch_all_invoices_for_period(args.start_date, args.end_date)
 
-    if not records:
+    if not all_records:
         print("\nNo invoice data found")
         sys.exit(0)
 
-    print(f"\nTotal invoice items fetched: {len(records)}")
+    # Write VAT output file if requested
+    if args.vat_out:
+        write_vat_output(all_records, args.vat_out)
+
+    # Filter by VAT numbers if file provided
+    if args.vat_file:
+        vat_data = read_vat_numbers(args.vat_file)
+        if not vat_data:
+            print("Error: No VAT numbers found in file", file=sys.stderr)
+            sys.exit(1)
+        print(f"\nFiltering by {len(vat_data)} VAT number(s) from {args.vat_file}")
+        records = filter_by_vat_numbers(all_records, vat_data)
+        print(f"Records after filtering: {len(records)}")
+    else:
+        # No filtering - set date_adjustment to 0 for all records
+        records = all_records
+        for r in records:
+            r["date_adjustment"] = 0
+
+    if not records:
+        print("\nNo invoice data after filtering")
+        sys.exit(0)
 
     # Aggregate data
     aggregated_data, dates = aggregate_data(records)
-    print(f"Unique (issuer, item) combinations: {len(aggregated_data)}")
+    print(f"\nUnique (issuer, item) combinations: {len(aggregated_data)}")
     print(f"Date range in data: {dates[0]} to {dates[-1]}" if dates else "No dates")
 
     # Generate output
